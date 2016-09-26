@@ -1,0 +1,200 @@
+###########################################################################################################################################################
+###########################################################################################################################################################
+####### Using Co-expression Networks to Inform GWAS
+###########################################################################################################################################################
+###########################################################################################################################################################
+
+# This code takes as input a list of GWAS SNPs and a co-expression network.
+# A list of genes implicated by the GWAS SNPs is generated and mapped
+# onto the co-expression network in order to identify modules enriched in
+# genes implicated by GWAS. The code is written to have as input a mouse
+# co-expression network, but can be easily modified to work with human
+# networks.
+
+##### STEP 1 PRELIMINARIES #################################################################################################################################
+##### ====== ============= #################################################################################################################################
+
+
+# install and load the following R packages
+library(reshape)
+library(dplyr)
+library(GenomicRanges)
+library(biomaRt)
+library(org.Hs.eg.db)
+
+##### STEP 2 BMD SNP IMPORT ################################################################################################################################
+##### ====== ===============################################################################################################################################
+
+# The list of GWAS SNPs should contain at least four columns, SNP, hg38_interval, hg38_interval_chr,
+# hg38_interval_left, hg38_interval_right
+# Below are the first ten lines from an example list. It was made by taking index SNPs and identifying
+# SNPs in LD (r2>0.7) using PLINK2 (https://www.cog-genomics.org/plink2/) and 1000 Genomes Phase 3 
+# genotypes (http://www.1000genomes.org). The locations of the left and right most SNPs at each association
+# were used to generate hg19 intervals.  The UCSC lift-over tool was used to convert to hg38 intervals.
+
+
+#SNP  hg19_pos ints.left.hg19 ints.right.hg19            hg19_interval            hg38_interval
+#1  chr1:22490724  22490724       22484575        22491843   chr1:22484575-22491843   chr1:22158082-22165350
+#2  chr1:22711473  22711473       22681214        22711473   chr1:22681214-22711473   chr1:22354721-22384980
+#3  chr1:68639385  68639385       68634593        68659982   chr1:68634593-68659982   chr1:68168910-68194299
+#4  chr1:68647716  68647716       68635743        68653489   chr1:68635743-68653489   chr1:68170060-68187806
+#5 chr1:172199573 172199573      172189764       172293142 chr1:172189764-172293142 chr1:172220624-172324002
+#6  chr2:42250549  42250549       42216386        42282829   chr2:42216386-42282829   chr2:41989246-42055689
+#hg38_interval_chr hg38_pos_interval hg38_interval_left hg38_interval_right LD_length
+#1              chr1          22164231           22158082            22165350      7268
+#2              chr1          22384980           22354721            22384980     30259
+#3              chr1          68173702           68168910            68194299     25389
+#4              chr1          68182033           68170060            68187806     17746
+#5              chr1         172230433          172220624           172324002    103378
+#6              chr2          42023409           41989246            42055689     66443
+
+# 'bmd_snps_hg38_intervals.csv' is provided as supplemental data
+snps<-read.csv('bmd_snps_hg38_intervals.csv',header=T)
+
+##### STEP 3 SNP ANNOTATION ################################################################################################################################
+##### ====== ============== ################################################################################################################################
+
+# 'hg38_RefSeq_072915.txt' was downloaded from the UCSC genome browser
+
+hg38.genes<-read.delim('hg38_RefSeq_072915.txt',header=T,sep='')
+hg38.genes<-hg38.genes[,-c(16,10,11)]# eliminate exon coordinates -
+# not needed and makes it a much more tidy file
+
+# eliminate transcripts that will not have a mouse homolog
+unwanted.list<-c("MIR","RNU","-",'LINC','LOC','SNOR')
+unwanted.genes<-c()
+for(i in 1:length(unwanted.list)){
+  unwanted.genes<-c(unwanted.genes,grep(unwanted.list[i],hg38.genes$name2))
+}
+length(unwanted.genes)
+
+hg38.genes1<-hg38.genes[-unwanted.genes,];dim(hg38.genes);dim(hg38.genes1) 
+
+hg38.genes1<-hg38.genes1[order(hg38.genes1$chrom,hg38.genes1$txStart),]
+hg38.genes1<-hg38.genes1[-grep("_",hg38.genes1$chrom),]
+hg38.genes1$chrom<-as.character(hg38.genes1$chrom)
+
+# only keep the longest transcript for each gene
+hg38.genes1$trans.length<-abs(hg38.genes1$txStart-hg38.genes1$txEnd)
+hg38.genes1<-hg38.genes1[order(hg38.genes1$trans.length,decreasing=T),]
+hg38.genes1<-subset(hg38.genes1,!duplicated(hg38.genes1$name2));dim(hg38.genes1)
+
+
+# create genomic range objects for hg38 genes and hg38 GWAS LD intervals
+snps.ranges<-GRanges(seqnames = Rle(as.character(snps[,'hg38_interval_chr'])), 
+                     IRanges(snps[,'hg38_interval_left'],snps[,'hg38_interval_right']),
+                     Rle(strand(c(rep("*",nrow(snps))))),snps=snps)
+
+hg38genes.ranges<-GRanges(seqnames = Rle(as.character(hg38.genes1[,'chrom'])), 
+                          IRanges(hg38.genes1[,'txStart'],hg38.genes1[,'txEnd']),
+                          Rle(strand(hg38.genes1$strand)),genes=hg38.genes1)
+
+
+# for each defined gwas ld region, identify all overlapping genes and the
+# gene closest upstream and the gene closest downstream
+gwas.genes<-c()
+for(i in 1:nrow(snps)){
+  t1<-subsetByOverlaps(hg38genes.ranges,snps.ranges[i],ignore.strand=T)
+  if(length(t1)==0 | length(t1)==1) {
+    t2<-hg38genes.ranges[precede(snps.ranges[i],hg38genes.ranges,ignore.strand=T)]
+    t2<-c(t2,hg38genes.ranges[follow(snps.ranges[i],hg38genes.ranges,ignore.strand=T)])
+    t.all<-c(t1,t2)
+  } else
+    t.all<-t1
+  t.all1<-data.frame(mcols(t.all))
+  t.all2<-data.frame(snps[i,],t.all1)
+  t.all2
+  gwas.genes<-rbind(gwas.genes,t.all2)
+  print(i)
+}
+gwas.genes
+
+gwas.genes$name3<-paste(gwas.genes$SNP,'.',gwas.genes$genes.name2,sep='')
+annot.gwas.snps3<-subset(gwas.genes,!duplicated(gwas.genes$name3));dim(annot.gwas.snps3)
+head(annot.gwas.snps3)
+
+#manually remove genes really far away (>1.5 Mbp) from GWAS hit (such cases are often
+# included because of gene deserts)
+annot.gwas.snps3$gene.dist.from.snp<-abs(annot.gwas.snps3$hg38_pos_interval-annot.gwas.snps3$genes.cdsStart)
+annot.gwas.snps3<-subset(annot.gwas.snps3,annot.gwas.snps3$gene.dist.from.snp<=1.5e6)
+
+save(annot.gwas.snps3,file='annot.gwas.snps3.Rdata')
+
+##### STEP 4 MOUSE HOMOLOG IDENTIFICATION ################################################################################################################################
+##### ====== ============================ ################################################################################################################################
+
+# generate a list of mouse homologs for
+listMarts(host='www.ensembl.org')
+human = useMart("ENSEMBL_MART_ENSEMBL", dataset = "hsapiens_gene_ensembl",host='www.ensembl.org')
+mouse = useMart("ENSEMBL_MART_ENSEMBL", dataset = "mmusculus_gene_ensembl",host='www.ensembl.org')
+
+table.1<-getLDS(attributes = c("hgnc_symbol"),
+                filters = "hgnc_symbol", values = annot.gwas.snps3$genes.name2,mart = human,
+                attributesL = c("ensembl_gene_id","mgi_symbol","external_gene_name","entrezgene",'illumina_mousewg_6_v1'), martL = mouse)
+
+mouse.gwas.homologs<-subset(table.1,(table.1[,'Illumina.MouseWG.6.v1.probe']!='' & 
+                                       !duplicated(table.1[,'Illumina.MouseWG.6.v1.probe'])))
+mouse.gwas.homlogs<-mouse.gwas.homologs[order(mouse.gwas.homologs[,1]),]
+
+# There will likely be human GWAS genes that do not return a homolog using the 
+# biomaRt query.  The following code will identify those genes.  We recommend manually
+# adding.  Examples of how to do this are provided below.
+
+k1<-match(as.character(annot.gwas.snps3[,'genes.name2']),mouse.gwas.homologs[,'HGNC.symbol'])
+genes.wo.mouse.homs<-annot.gwas.snps3[-k1 %in% NA,];dim(genes.wo.mouse.homs)
+genes.wo.mouse.homs1<-genes.wo.mouse.homs[order(genes.wo.mouse.homs[,'genes.name2']),]
+genes.wo.mouse.homs1$genes.name2
+
+# missing genes
+#[1] C2orf73   C2orf91   C7orf76   CASC17    CDC5L     CHPF2     CRHR1     DCDC1     DCDC5     DIRAS3    DIRAS3    DNM3OS    ESPL1     FAM9A     
+# FAM9B     KIAA2018  LRRC37A4P MGC57346  PA2G4P4   PRDM12   RPL23AP32 SHFM1     STH       ZNF621   
+
+temp1<-data.frame('CDC5L','ENSMUSG00000023932','Cdc5l','Cdc5l','71702','ILMN_2672664');colnames(temp1)<-colnames(mouse.gwas.homologs)
+temp2<-data.frame('CDC5L','ENSMUSG00000023932','Cdc5l','Cdc5l','71702','ILMN_2754425');colnames(temp2)<-colnames(mouse.gwas.homologs)
+temp3<-data.frame('CDC5L','ENSMUSG00000023932','Cdc5l','Cdc5l','71702','ILMN_2703899');colnames(temp3)<-colnames(mouse.gwas.homologs)
+temp4<-data.frame('DCDC5','ENSMUSG00000074981','Dcdc5','Dcdc5','329482','ILMN_2619022');colnames(temp4)<-colnames(mouse.gwas.homologs)
+temp5<-data.frame('ESPL1','ENSMUSG00000058290','Espl1','Espl1','105988','ILMN_2911855');colnames(temp5)<-colnames(mouse.gwas.homologs)
+temp6<-data.frame('CHPF2','ENSMUSG00000038181','Chpf2','Chpf2','100910','ILMN_2702868');colnames(temp6)<-colnames(mouse.gwas.homologs)
+temp7<-data.frame('PRDM12','ENSMUSG00000078190','Prdm12','Prdm12','381359','ILMN_1259430');colnames(temp7)<-colnames(mouse.gwas.homologs)
+temp8<-data.frame('PRDM12','ENSMUSG00000025935','Prdm12','Prdm12','381359','ILMN_1248244');colnames(temp8)<-colnames(mouse.gwas.homologs)
+temp9<-data.frame('DNM3OS','ENSMUSG00000078190','Dnm3os','Dnm3os','474332','ILMN_2482263');colnames(temp9)<-colnames(mouse.gwas.homologs)
+temp10<-data.frame('DNM3OS','ENSMUSG00000078190','Dnm3os','Dnm3os','474332','ILMN_1255731');colnames(temp10)<-colnames(mouse.gwas.homologs)
+temp11<-data.frame('LRRC37A','ENSMUSG00000078632','Lrrc37a','Lrrc37a','237954','ILMN_1220636');colnames(temp11)<-colnames(mouse.gwas.homologs)
+temp12<-data.frame('LRRC37A','ENSMUSG00000078632','Lrrc37a','Lrrc37a','237954','ILMN_1221176');colnames(temp12)<-colnames(mouse.gwas.homologs)
+temp13<-rbind(temp1,temp2,temp3,temp4,temp5,temp6, temp7, temp8, temp9, temp10, temp11, temp12)
+
+mouse.gwas.homologs<-rbind(mouse.gwas.homologs,temp13)
+mouse.gwas.homologs<-mouse.gwas.homologs[order(mouse.gwas.homologs[,1]),]
+length(unique(mouse.gwas.homologs[,1]))
+save(mouse.gwas.homologs,file='mouse.gwas.homologs.Rdata')
+
+##### STEP 5 MOUSE HOMOLOG NETWORK OVERLAY ##############################################################################################################################
+##### ====== ============================= ##############################################################################################################################
+
+# you will need to read in a network file
+# if it is a mouse network it will need to contain columns for probe id, symbol and gene ID
+# you will need to customize this part of the code to work for your particular network
+# in this example we used a file “kme.all.071415.csv” that contained the following columns 'Illumina_Probe_ID_V3' = Illumina Mouse WG6v1 probe ids,
+# ’Symbol’ = MGI mouse gene symbol and ‘GeneId’ = NCBI gene id and ‘mwga.bone.network.colors’ was the module membership of each probe (for our network
+# this was a number ranging from 0 to 21.
+
+# add probe ids to kme.all
+rm(kme.all1)
+kme.all<-read.csv('kme.all.071415.csv',header=T,na.strings="NA")
+ill.annot<-read.csv('IlluminaMouseWG-6v1_Oct08.071415.csv',header=T)
+ill.annot.short<-ill.annot[,c('Array_Address_ID','Gene_Symbol','Illumina_Probe_ID_V3')]
+kme.all1<-merge(kme.all,ill.annot.short,by.x=3,by.y=1);dim(kme.all1);tail(kme.all1)
+
+# Identifying overlap based on array probe and gene symbols
+y1<-kme.all1[kme.all1[,'Illumina_Probe_ID_V3'] %in% mouse.gwas.homologs[,'Illumina.MouseWG.6.v1.probe'],]
+y2<-kme.all1[kme.all1[,'Symbol'] %in% mouse.gwas.homologs[,'MGI.symbol'],]
+y3<-kme.all1[kme.all1[,'GeneId'] %in% mouse.gwas.homologs[,'EntrezGene.ID'],]
+kme.all.homs<-rbind(y1,y2, y3);head(kme.all.homs);dim(kme.all.homs)
+
+kme.all.homs<-subset(kme.all.homs, !duplicated(kme.all.homs[,'Illumina_Probe_ID_V3']))
+kme.all.homs<-kme.all.homs[order(kme.all.homs[,'Gene_Symbol']),]
+
+# kme.all.homs.net contains
+kme.all.homs.net<-subset(kme.all.homs,kme.all.homs[,'mwga.bone.network.colors']!=0)
+
+
